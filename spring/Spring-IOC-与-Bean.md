@@ -1054,6 +1054,6 @@ UtilsB context == ctx ? true
 1. **`refresh()` 十二步** — `AbstractApplicationContext#refresh()` 是容器启动的总纲，值得逐行读。
 2. **把 `CustomBeanRegistry` 改成真正的"多实例"版本** — 从 `application.yml` 读一个名字列表，循环注册（见 8.6 ④）。这是理解动态注册最快的练习。
 3. **循环依赖 + AOP** — 第七章推演过纯净版；给 `ImoocCycleA` 加个切面，在 `getEarlyBeanReference` 打断点，看二级缓存里存的是不是代理对象，以及 `earlyProxyReferences` 怎么避免重复代理。再试试给其中一个加 `@Async`，复现 7.6 ③ 那个报错。
-4. **AOP 的接入点** — 在 `postProcessAfterInitialization` 打断点，看 `AnnotationAwareAspectJAutoProxyCreator` 怎么把 Bean 换成代理对象。
+4. **AOP 的接入点** — 在 `postProcessAfterInitialization` 打断点，看 `AnnotationAwareAspectJAutoProxyCreator` 怎么把 Bean 换成代理对象。概念与实战已展开成独立笔记：《[Spring-AOP](Spring-AOP.md)》。
 5. **作用域** — singleton / prototype / request / session，以及 `@Scope(proxyMode = ...)` 解决"长生命周期注入短生命周期"的问题。
 6. **BPP 顺序实验** — 给 `ImoocBean` 和 `CouponHandlerFactory` 分别实现 `Ordered` 返回不同值，观察日志顺序变化；再换成只标 `@Order` 注解，验证 6.6 说的"注解对 BPP 不生效"。
