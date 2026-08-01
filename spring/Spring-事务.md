@@ -345,3 +345,4 @@ i.g.l.j.JavaLearnerApplication : [失效④自调用] invalid4-user 落库? true
 3. **读 `TransactionInterceptor#invokeWithinTransaction`** — 声明式事务的总入口，和 AOP 笔记的 `@Around` 对照着读。
 4. **`setRollbackOnly()` 实验** — 在 catch 块里手动标记回滚，验证 6.1 的解法。
 5. **`UnexpectedRollbackException`** — 内层 `REQUIRED` 方法把事务标了 rollback-only，外层却想提交时的经典报错，值得主动复现一次。
+6. **事务 + 事件** — `@TransactionalEventListener(phase = AFTER_COMMIT)` 解决"事务还没提交，监听器就去查库查不到"的问题，见《[Spring-事件驱动](Spring-事件驱动.md)》6.4。
