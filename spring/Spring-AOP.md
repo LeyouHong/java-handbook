@@ -334,7 +334,7 @@ SLF4J 的 `{}` 只按**位置**依次填参，不看语义。修正为 `returnLo
 
 ## 九、可以继续挖的方向
 
-1. **`@Transactional` 就是 AOP** — 事务切面 `TransactionInterceptor` 的 invoke 值得读，自调用失效在事务上复现一遍最有体感。
+1. **`@Transactional` 就是 AOP** — 事务切面 `TransactionInterceptor` 的 invoke 值得读，自调用失效在事务上复现一遍最有体感。已展开成独立笔记：《[Spring-事务](Spring-事务.md)》。
 2. **多切面排序** — 两个切面命中同一方法时，用 `@Order` 控制洋葱的内外层，打日志验证执行顺序。
 3. **循环依赖 + AOP** — IOC 笔记十一.3 的实验：给 `ImoocCycleA` 加 `@ReturnLog`，在 `getEarlyBeanReference` 打断点，看二级缓存里存的是不是代理。
 4. **在 `postProcessAfterInitialization` 打断点** — 亲眼看 `AnnotationAwareAspectJAutoProxyCreator` 返回代理对象的瞬间（IOC 笔记十一.4）。
