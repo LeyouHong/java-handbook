@@ -714,34 +714,356 @@ SELECT * FROM worker WHERE name = 'yw';
 | **必须有主键** | 没有主键时 InnoDB 会用第一个唯一非空索引；再没有就自建 6 字节隐藏 `row_id`，且它全局共享，高并发插入是竞争点 |
 | 联合索引有**最左前缀** | 叶子层是按 (a,b,c) 依次排序的，a 不确定时 b、c 在全局就是乱序的，无法二分 |
 
-### 最左前缀在 B+ 树上长什么样
-
-联合索引 `(type, salary, name)` 的叶子层实际排列：
-
-```
-   type  salary  name
-   ────────────────────
-    A     1000   li      ┐
-    A     2000   wang    ├─ type=A 这一段内，salary 全局有序 ✓
-    A     3000   zhao    ┘
-    B      500   qian    ┐
-    B     2000   qinyi   ├─ type 一变，salary 从头开始排
-    B     2000   sun     │   （salary=2000 这一小段内，name 才有序）
-    B     5000   zhou    ┘
-    C     1500   wu
-
-   查 WHERE salary = 2000  →  2000 分散在 A、B、C 各段里，
-                              整棵树上无法二分定位 → 索引用不上 ✗
-   查 WHERE type = 'B'     →  B 连成一片，一次定位 + 顺序扫 ✓
-```
-
-**"最左前缀"不是一条人为规定，而是排序方式的必然结果。**
+联合索引怎么排、为什么有最左前缀，单独用下一章展开。
 
 ---
 
-## 八、动手观察
+## 八、联合索引：把多列拼成一个排序键
 
-### 8.1 看页大小和表的实际空间
+联合索引是索引里最容易出错的部分。但只要接受**一个设定**，所有规则都能自己推出来：
+
+> **联合索引的 key 不是"三个列"，而是【一个由三列拼成的元组】。**
+> 比较两个 key 时，按字典序逐列比：先比第一列，相等才比第二列，再相等才比第三列。
+
+这和查英文字典一模一样：`(A, 1000, li)` 排在 `(A, 2000, wang)` 前面，因为第一列相等、第二列 1000 < 2000。
+
+### 8.1 示例数据
+
+沿用 worker 表，建索引 `idx_tsn (type, salary, name)`，表里 8 行：
+
+```sql
+KEY idx_tsn (type, salary, name)
+```
+
+```
+   按 (type, salary, name) 排好序后的样子（这就是叶子层的顺序）：
+
+   序号  type  salary  name    id       ← id 是主键，二级索引叶子里必然带着它
+   ────────────────────────────────
+    ①     A    1000    li      7
+    ②     A    2000    wang    3        ┐ type=A 这一段内，salary 有序
+    ③     A    3000    zhao    9        ┘
+    ④     B     500    qian    1        ← type 变成 B，salary 从 500 重新开始
+    ⑤     B    2000    qinyi   5        ┐ salary=2000 这一小段内，
+    ⑥     B    2000    sun     2        ┘ name 才有序（qinyi < sun）
+    ⑦     B    5000    zhou    8
+    ⑧     C    1500    wu      4
+```
+
+**三条观察**，后面所有结论都来自它们：
+
+```
+   观察 1：type   在【整棵树】上有序          → 可以直接二分定位
+   观察 2：salary 只在【同一个 type 内】有序   → 必须先定住 type
+   观察 3：name   只在【同一个 (type,salary) 内】有序 → 必须先定住前两列
+```
+
+### 8.2 这棵树完整长什么样
+
+联合索引也是二级索引，规则和第三章讲的完全一样，只是 key 变成了元组、叶子里存主键：
+
+```
+                              根页
+        ┌──────────────────────────────────────────┐
+        │ [(A,1000,li) -> #20]  [(B,2000,qinyi) -> #21] │   ← key 是【整个元组】
+        └────────┬────────────────────┬────────────┘
+                 ▼                    ▼
+           叶子页 #20            叶子页 #21
+   ┌───────────────────┐  ┌───────────────────┐
+   │ A │1000│li   │ 7  │  │ B │2000│qinyi│ 5  │
+   │ A │2000│wang │ 3  │⇄ │ B │2000│sun  │ 2  │⇄ …
+   │ A │3000│zhao │ 9  │  │ B │5000│zhou │ 8  │
+   │ B │ 500│qian │ 1  │  │ C │1500│wu   │ 4  │
+   └───────────────────┘  └───────────────────┘
+     ↑    ↑    ↑     ↑
+   type salary name  主键 id ← 没有其他列！要 version 之类的就得回表
+```
+
+注意两点：
+
+- **非叶子节点的 key 也是完整元组**（`(A,1000,li)`），不是只有第一列。所以索引列越多越宽，扇出越小，树越容易长高——这是"联合索引别无脑加列"的物理原因。
+- 对**非唯一**的二级索引，InnoDB 会把主键追加进 key 里做唯一化，所以真实的排序键其实是 `(type, salary, name, id)`。这个细节在 8.6 讲 `ORDER BY id` 时会用到。
+
+### 8.3 六条 SQL 在树上的走位
+
+**① `WHERE type = 'B'` —— 满血命中**
+
+```
+   ①A,1000  ②A,2000  ③A,3000  ④B,500  ⑤B,2000  ⑥B,2000  ⑦B,5000  ⑧C,1500
+                                 └──────────────┬──────────────┘
+                                    二分定位到 ④，顺序扫到 ⑦ 停
+   type=ALL 的 B 连成【一片连续区间】 → 一次定位 + 顺序扫    ✓
+   key_len = type 的长度
+```
+
+**② `WHERE type='B' AND salary=2000` —— 定位更精确**
+
+```
+   ④B,500   ⑤B,2000  ⑥B,2000  ⑦B,5000
+             └────┬────┘
+        先按 type 定到 B 段，再在段内按 salary 二分   ✓✓
+   key_len = type + salary
+```
+
+**③ `WHERE type='B' AND salary=2000 AND name='sun'` —— 三列全用上**
+
+```
+   ⑤B,2000,qinyi   ⑥B,2000,sun
+                     └─ 在 (B,2000) 这一小段内按 name 二分   ✓✓✓
+   key_len = type + salary + name          ← 满血，直接定位到唯一一行
+```
+
+**④ `WHERE salary = 2000` —— 索引用不上**
+
+```
+   ①A,1000  ②A,2000  ③A,3000  ④B,500  ⑤B,2000  ⑥B,2000  ⑦B,5000  ⑧C,1500
+              ★                          ★        ★
+              └──── 2000 分散在 A 段和 B 段里，中间隔着 3000、500 ────┘
+
+   整棵树上 salary 不是有序的 → 无法二分 → 索引用不上（type=ALL 全表扫）  ✗
+```
+
+这就是"最左前缀"的全部真相：**不是 MySQL 规定你必须带上第一列，而是不带第一列时，后面的列在树上根本没有顺序可言。**
+
+**⑤ `WHERE type='B' AND name='sun'` —— 中间断了一列**
+
+```
+   ④B,500,qian   ⑤B,2000,qinyi   ⑥B,2000,sun   ⑦B,5000,zhou
+   └──────────── type='B' 能定位到这一片 ────────────┘
+                                    ★
+        但 name 在 B 段内是乱序的（qian → qinyi → sun → zhou 只是碰巧）
+        实际顺序由 salary 主导，name 无法二分   ✗
+
+   结果：type 用于定位（key_len 只含 type），
+        name 只能对扫出来的 4 行【逐行过滤】
+```
+
+不过 name **就在索引里**，所以 MySQL 5.6+ 会用**索引下推（ICP）**在引擎层先过滤掉不匹配的，再回表：
+
+```
+   没有 ICP：扫出 4 行 → 全部回表 4 次 → Server 层筛 name → 剩 1 行
+   有  ICP：扫出 4 行 → 在索引里就筛掉 3 行 → 只回表 1 次     ✓
+            EXPLAIN 的 Extra 显示 Using index condition
+```
+
+**⑥ `WHERE type='B' AND salary>1000 AND name='sun'` —— 范围截断**
+
+```
+   ④B,500   ⑤B,2000,qinyi   ⑥B,2000,sun   ⑦B,5000,zhou
+             └────────── salary>1000 是一个【范围区间】 ──────────┘
+
+   在这个区间里，salary 有 2000、2000、5000 三种值
+   → name 的顺序被 salary 打断（qinyi, sun, zhou 跨了不同的 salary）
+   → name 无法用于定位，只能 ICP 过滤   ✗
+
+   key_len = type + salary（不含 name）
+```
+
+**规律**：
+
+```
+   等值列 = 把范围收窄成"一个点"，后面的列在这个点内仍然有序  → 可以继续用
+   范围列 = 把范围拉成"一段"，后面的列跨越多个值，顺序被打断  → 到此为止
+```
+
+### 8.4 一张走位总表
+
+索引 `(a, b, c)`：
+
+| WHERE 条件 | 定位用到几列 | `key_len` | 说明 |
+|---|---|---|---|
+| `a=1` | a | a | ✓ |
+| `a=1 AND b=2` | a, b | a+b | ✓ |
+| `a=1 AND b=2 AND c=3` | a, b, c | a+b+c | ✓ 满血 |
+| `b=2 AND a=1` | a, b | a+b | 书写顺序无关，优化器会重排 |
+| `a=1 AND c=3` | a | a | 中间断了，c 只能 ICP 过滤 |
+| `a=1 AND b>2 AND c=3` | a, b | a+b | 范围截断，c 只能 ICP 过滤 |
+| `a>1 AND b=2` | a | a | 同上，b 只能 ICP 过滤 |
+| `b=2 AND c=3` | **无** | — | ✗ 缺最左列，索引整个用不上 |
+| `a LIKE 'x%'` | a | a | 前缀匹配 = 范围，可用 |
+| `a LIKE '%x'` | **无** | — | ✗ 定位不到起点 |
+| `a=1 ORDER BY b` | a | a | ✓ 且免 filesort（见 8.6） |
+
+### 8.5 一个例外：`IN` 不会截断后面的列
+
+这是个很多人不知道、但很实用的细节。
+
+```sql
+-- 直觉上以为 IN 是"范围"，后面的列该用不上了
+WHERE type IN ('A','B') AND salary = 2000
+```
+
+实际上**能用上 salary**：
+
+```
+   MySQL 把 IN 拆成【多个等值区间】，每个区间内后续列依然有序：
+
+   区间 1：type='A' → 在 A 段内按 salary 二分 → 找到 ②      ✓
+   区间 2：type='B' → 在 B 段内按 salary 二分 → 找到 ⑤⑥     ✓
+
+   EXPLAIN：type=range，但 key_len 包含 type + salary
+```
+
+对比一下就很清楚：
+
+```
+   ✓ WHERE type IN ('A','B') AND salary=2000    → 2 个点，各自内部有序，salary 可用
+   ✗ WHERE type > 'A'        AND salary=2000    → 一整段，跨多个 type，salary 不可用
+```
+
+**实用推论**：能写成 `IN` 就别写成范围。比如筛状态时 `status IN (1,2,3)` 比 `status < 4` 更能让后续列用上索引。
+
+### 8.6 `ORDER BY` 怎么蹭这棵树
+
+叶子层本来就有序，排序如果能顺着索引读，就能省掉 `filesort`（一次内存/磁盘排序）。
+
+```sql
+-- ✓ 免 filesort：type 定位到 B 段，段内 salary 天然有序，顺着链表读就行
+SELECT * FROM worker WHERE type='B' ORDER BY salary;
+
+-- ✓ 也免：全部降序 → 反向扫描叶子链表（双向链表的价值）
+SELECT * FROM worker WHERE type='B' ORDER BY salary DESC;
+
+-- ✓ 也免：排序列就是索引的第 2、3 列，顺序一致
+SELECT * FROM worker WHERE type='B' ORDER BY salary, name;
+
+-- ✗ 要 filesort：salary 在全树上无序（同 8.3 的 ④）
+SELECT * FROM worker ORDER BY salary;
+
+-- ✗ 要 filesort：跳过了 salary，name 在 B 段内是乱的
+SELECT * FROM worker WHERE type='B' ORDER BY name;
+
+-- ✗ 要 filesort（MySQL 8.0 之前）：一升一降，扫不出这个顺序
+SELECT * FROM worker WHERE type='B' ORDER BY salary ASC, name DESC;
+--   MySQL 8.0 可以建降序索引来支持：KEY (type, salary ASC, name DESC)
+```
+
+一个容易忽略的点，用到 8.2 里那个"主键被追加进 key"的细节：
+
+```sql
+-- ✗ 要 filesort：B 段内先按 salary 排，id 是乱的
+SELECT * FROM worker WHERE type='B' ORDER BY id;
+
+-- ✓ 免 filesort：前三列都定死了，真实排序键 (type,salary,name,id) 只剩 id 在动
+SELECT * FROM worker WHERE type='B' AND salary=2000 AND name='sun' ORDER BY id;
+```
+
+**规律**：`ORDER BY` 的列必须是索引里**紧接在等值列之后**的那几列，且方向一致。
+
+### 8.7 列序怎么定：三步法
+
+```
+   第 1 步：等值条件的列  →  放最前面
+   第 2 步：范围条件 / ORDER BY 的列  →  放最后
+   第 3 步：多个等值列之间，按区分度从高到低排
+           SELECT COUNT(DISTINCT col)/COUNT(*) FROM t;   ← 越接近 1 越靠前
+```
+
+拿一条真实查询走一遍：
+
+```sql
+SELECT * FROM worker WHERE type='B' AND salary>2000 ORDER BY salary;
+```
+
+```
+   ✗ 建成 (salary, type)
+   ───────────────────────────
+   salary>2000 是范围 → 后面的 type 被截断，用不上
+   而且 salary 的区间横跨所有 type，扫描行数暴涨
+
+   ✓ 建成 (type, salary)
+   ───────────────────────────
+   type='B' 等值定位 → B 段内 salary 天然有序
+   → 范围扫描直接命中，ORDER BY 还顺带免了 filesort
+
+   同一条 SQL，列序反一下就是几十倍的差距。
+```
+
+**为什么区分度高的列要靠前**：区分度决定了第一次定位能砍掉多少行。
+
+```
+   假设 1000 万行，type 只有 3 种值、name 有 900 万种值
+
+   索引 (type, name)：type='B' 先砍到 ~333 万行，再按 name 定位
+   索引 (name, type)：name='sun' 直接砍到 ~1 行             ← 效率高得多
+```
+
+（当然前提是查询里真的会用 `name` 做等值条件——**索引永远是为查询建的**。）
+
+### 8.8 一个联合索引顶几个用
+
+```
+   索引 (a, b, c) 等价于同时拥有：
+
+   ✓ (a)
+   ✓ (a, b)
+   ✓ (a, b, c)
+
+   ✗ (b)      ✗ (c)      ✗ (b, c)      ✗ (a, c)   ← 常见误解！
+```
+
+**`(a, c)` 用不上**，因为 c 的顺序由 b 主导（就是 8.3 的例子 ⑤）。这条经常被记错。
+
+由此得到两条实用结论：
+
+```
+   ① 已经有 (a,b,c) 了，就【别再建】 (a) 和 (a,b) —— 纯冗余，白维护一棵树
+   ② 如果确实需要单独按 b 查，那要么新建 (b,...) 索引，
+      要么调整列序看能不能一棵树同时满足两类查询
+```
+
+### 8.9 用 `key_len` 验证你的判断
+
+前面所有"用上了几列"的结论，都不用猜——`EXPLAIN` 的 `key_len` 会告诉你。
+
+```
+   每列的 key_len = 类型字节数
+                  + 1（该列允许 NULL）
+                  + 2（变长类型如 VARCHAR）
+```
+
+以 `worker(type CHAR(64) NOT NULL, salary BIGINT NULL, name CHAR(64) NOT NULL)`、`CHARSET=utf8` 为例：
+
+```
+   type   = 64 × 3        = 192
+   salary = 8 + 1（可空）  =   9
+   name   = 64 × 3        = 192
+
+   key_len = 192  → 只用上 type
+   key_len = 201  → 用上 type + salary
+   key_len = 393  → 三列全用上
+```
+
+```sql
+-- 实测：改一改条件，看 key_len 怎么变
+EXPLAIN SELECT * FROM worker WHERE type='B';                              -- 192
+EXPLAIN SELECT * FROM worker WHERE type='B' AND salary=2000;              -- 201
+EXPLAIN SELECT * FROM worker WHERE type='B' AND salary=2000 AND name='s'; -- 393
+EXPLAIN SELECT * FROM worker WHERE type='B' AND salary>2000 AND name='s'; -- 201 ← 被范围截断
+EXPLAIN SELECT * FROM worker WHERE type IN ('A','B') AND salary=2000;     -- 201 ← IN 不截断
+```
+
+**最后一行和倒数第二行的对比，是这一整章最值得记住的实验。**
+
+### 8.10 本章小结
+
+```
+   联合索引 = 把多列拼成一个元组，按字典序排成一棵树
+        ↓
+   ┌─ 前面的列取【等值】 → 范围收窄成一个点 → 后面的列在点内仍有序 → 可继续定位
+   ├─ 前面的列取【范围】 → 范围拉成一段     → 后面的列顺序被打断   → 只能 ICP 过滤
+   └─ 缺了最左的列       → 整棵树上无序     → 索引完全用不上
+        ↓
+   列序三步法：等值列在前（按区分度排）→ 范围/排序列在后
+        ↓
+   用 EXPLAIN 的 key_len 验证，别靠猜
+```
+
+---
+
+## 九、动手观察
+
+### 9.1 看页大小和表的实际空间
 
 ```sql
 SHOW VARIABLES LIKE 'innodb_page_size';        -- 16384
@@ -755,14 +1077,14 @@ FROM information_schema.tables
 WHERE table_schema = 'imooc_ecommerce_data';
 ```
 
-拿到"平均行字节"后，就能自己套第四节的公式估树高了：
+拿到"平均行字节"后，就能自己套第四章的公式估树高了：
 
 ```
    叶子每页行数 = 16384 / 平均行字节
    3 层容量     = 1170 × 1170 × 叶子每页行数
 ```
 
-### 8.2 从 Buffer Pool 里看索引页
+### 9.2 从 Buffer Pool 里看索引页
 
 ```sql
 SELECT index_name, page_type, COUNT(*) AS pages
@@ -773,9 +1095,9 @@ GROUP BY index_name, page_type;
 
 > 想精确看到每一层的页号和 `PAGE_LEVEL`，需要外部工具（如 `innodb_ruby` 的
 > `space-index-pages-summary`）直接解析 ibd 文件，MySQL 本身没有内置命令。
-> 日常用第四节的公式估算就够了。
+> 日常用第四章的公式估算就够了。
 
-### 8.3 验证树高对性能的影响
+### 9.3 验证树高对性能的影响
 
 ```sql
 -- 造数据后对比：窄表 vs 宽表在同样行数下的 IO 差异
@@ -787,7 +1109,7 @@ EXPLAIN ANALYZE SELECT * FROM worker WHERE id = 8888888;   -- 8.0.18+ 给出真�
 
 ---
 
-## 九、一图总结
+## 十、一图总结
 
 ```
    磁盘 IO 慢 10 万倍
