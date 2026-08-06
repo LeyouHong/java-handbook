@@ -24,7 +24,7 @@
 
 | 笔记 | 内容 |
 |---|---|
-| [LSM Tree 原理（以 RocksDB 为例）](storage/LSM树原理.md) | 《B+ 树原理》的对照篇：为什么要把随机写变顺序写、WAL + MemTable 写路径、SST 文件结构与 Bloom Filter、从新到旧的读路径与读放大、Leveled vs Tiered Compaction、墓碑与删除的坑、RUM 三角取舍、LSM vs B+ 树选型、RocksDB 参数速查 |
+| [LSM Tree 原理（以 RocksDB 为例）](storage/LSM树原理.md) | 《B+ 树原理》的对照篇：B+ 树何时是顺序写何时退化成随机写、WAL + MemTable 写路径、SST 文件结构与 Bloom Filter、从新到旧的读路径与读放大、Leveled vs Tiered Compaction、墓碑与删除的坑、RUM 三角取舍、LSM vs B+ 树选型、RocksDB 参数速查 |
 
 <!-- 新增笔记时在上面的表格里加一行 -->
 
