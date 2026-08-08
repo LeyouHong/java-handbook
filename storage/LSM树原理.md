@@ -3,9 +3,11 @@
 > 这篇不讲理论，也不做结构对比。
 > 我们**从最笨的办法开始，自己动手造一个存储引擎**——每遇到一个问题就想一个办法，
 > 十步之后你会发现：造出来的东西就是 LSM Tree，也就是 RocksDB 的内核。
+> 最后一步再把上层的 SQL 接上，看看一条 `UPDATE` 落到底下究竟变成了什么。
 >
 > 读完你应该能回答：MemTable 是什么、为什么要有 WAL、SSTable 凭什么快、
-> Compaction 到底在合并什么、删除的数据为什么删不掉。
+> Compaction 到底在合并什么、删除的数据为什么删不掉、
+> 以及 —— RocksDB 到底有没有 SQL。
 
 ---
 
@@ -296,8 +298,8 @@ MemTable 需要一个"能快速查找的有序结构"。为什么最后选了跳
 ```
    插入一个新 key：
    · 它一定进「层0」（完整数据层）
-   · 抛一次硬币，正面 → 也放进 L1
-   · 再抛一次，正面 → 也放进 L2
+   · 抛一次硬币，正面 → 也放进「层1」
+   · 再抛一次，正面 → 也放进「层2」
    · ...直到抛出反面为止
 
    结果：约 1/2 的节点在「层1」，1/4 在「层2」，1/8 在「层3」……
@@ -1021,7 +1023,325 @@ db->GetProperty("rocksdb.num-files-at-level0", &v);  // 最重要的单一指标
 
 ---
 
-## 十步回顾
+## 第 13 步：上层的 SQL 是怎么落到 KV 上的
+
+先纠正一个很常见的误解：**RocksDB 没有 SQL**。
+
+它是一个**嵌入式 KV 存储库**（一个链接进你程序的库，不是一个能连接的服务），对外只有四个操作：
+
+```cpp
+db->Put(key, value);      // 写
+db->Get(key, &value);     // 读
+db->Delete(key);          // 删
+db->NewIterator();        // 范围扫描
+```
+
+SQL 是**上层**的事。真正有意思的问题是：**一条 SQL 怎么变成这四个操作？**
+
+```
+   ┌──────────────────────────────────────────┐
+   │  SQL 层（MyRocks / TiDB / CockroachDB）   │
+   │  解析 SQL → 优化 → 生成执行计划            │
+   │  【关系表 ⇄ KV 的编码规则也在这一层】       │
+   └────────────────┬─────────────────────────┘
+                    │  Put / Get / Delete / Iterator
+                    ▼
+   ┌──────────────────────────────────────────┐
+   │  RocksDB（前面 12 步造的那个东西）          │
+   │  MemTable / WAL / SSTable / Compaction    │
+   └──────────────────────────────────────────┘
+```
+
+### 13.1 一张表怎么变成 KV
+
+```sql
+CREATE TABLE user (
+  id   BIGINT PRIMARY KEY,
+  name VARCHAR(32),
+  age  INT,
+  KEY idx_age (age)          -- 二级索引
+);
+```
+
+SQL 层给每个索引分配一个编号，按固定规则拼 key（下面是简化写法，真实实现是二进制编码）：
+
+```
+   主键（存整行数据）
+   ┌──────────────────────────────────────┐
+   │  key   = t100_r{主键值}               │
+   │  value = 其余所有列                    │
+   └──────────────────────────────────────┘
+
+   二级索引 idx_age（只存指向主键的"指针"）
+   ┌──────────────────────────────────────┐
+   │  key   = t100_i2_{age值}_{主键值}     │
+   │  value = 空                           │
+   └──────────────────────────────────────┘
+```
+
+表里三行数据，在 RocksDB 里实际长这样——**注意所有 key 混在同一个有序空间里，靠前缀区分**：
+
+```
+   RocksDB 的 key 空间（全局按字节序排序）
+
+   t100_i2_25_5      → ""              ┐
+   t100_i2_25_9      → ""              ├ idx_age 的索引项，按 age 排序
+   t100_i2_30_3      → ""              ┘
+   t100_r3           → ["Carol", 30]   ┐
+   t100_r5           → ["Alice", 25]   ├ 主键数据，按 id 排序
+   t100_r9           → ["Bob",   25]   ┘
+```
+
+### 13.2 关键设计：key 必须"保序编码"
+
+RocksDB 按 **key 的字节序**排序。所以 SQL 层必须保证：**字节序 = 逻辑序**。
+
+```
+   ✗ 整数按机器字节序存（小端）
+     5   → 05 00 00 00
+     300 → 2C 01 00 00
+     按字节比较：2C > 05，得出 300 < 5   ❌ 排序全乱
+
+   ✓ 转成大端序再存
+     5   → 00 00 00 05
+     300 → 00 00 01 2C
+     按字节比较：结果正确 ✓
+
+   负数还要额外处理（翻转符号位），否则 -1 会排到最大
+```
+
+这套编码叫 **memcomparable format**，是整个设计的地基。有了它，
+"按 id 排序"和"按字节排序"变成同一件事——于是 `ORDER BY`、`BETWEEN`
+全都能直接变成 LSM 的**顺序扫描**。
+
+### 13.3 逐条走一遍
+
+**① INSERT**
+
+```sql
+INSERT INTO user VALUES (5, 'Alice', 25);
+```
+
+```cpp
+WriteBatch batch;
+batch.Put("t100_r5",      encode("Alice", 25));   // 主键：存整行
+batch.Put("t100_i2_25_5", "");                    // 索引：age=25 → id=5
+db->Write(batch);          // ← 整批【原子】写入
+```
+
+落到 LSM 层（对照第 5 步）：
+
+```
+   ① 两条记录一起追加到 WAL（一次顺序写）
+   ② 两条记录插入 MemTable（跳表，内存）
+   ③ 返回成功 ✓
+   全程没碰磁盘上的数据文件，也没有任何查找
+```
+
+> **为什么必须用 `WriteBatch`**：一行数据对应多个 key，必须要么全成功要么全失败，
+> 否则会出现"主键有数据但索引里没有"的不一致。RocksDB 保证一个 batch 内的原子性。
+
+**索引越多写放大越明显**：3 个二级索引 = 一次 INSERT 变成 4 个 Put。
+
+**② 按主键查询 → 1 次 Get**
+
+```sql
+SELECT * FROM user WHERE id = 5;      →   db->Get("t100_r5", &value);
+```
+
+```
+   MemTable        找 → 没有
+   L0 的 4 个文件   布隆过滤器说"不存在" → 跳过，不读磁盘
+   L1              布隆过滤器说"不存在" → 跳过
+   L2              布隆过滤器说"可能有" → 真读一次磁盘 → 命中 ✓
+   → 1 次磁盘 IO（对照第 8、9 步）
+```
+
+**③ 按二级索引查询 → 这就是"回表"**
+
+```sql
+SELECT * FROM user WHERE age = 25;
+```
+
+```cpp
+// 阶段 1：在索引区间上扫描，收集主键
+it->Seek("t100_i2_25_");
+while (it->key().starts_with("t100_i2_25_")) {
+    ids.push_back(parse_pk(it->key()));    // 从 key 里解析出主键
+    it->Next();
+}
+// → ids = [5, 9]
+
+// 阶段 2：拿主键回去取整行 —— 回表
+for (id : ids) db->Get("t100_r" + id, &value);
+```
+
+```
+   t100_i2_25_5   ┐ Seek 定位到这里，顺序 Next
+   t100_i2_25_9   ┘ 前缀不匹配就停
+   t100_i2_30_3
+   ...
+   t100_r5        ← 回表 Get
+   t100_r9        ← 回表 Get
+```
+
+**代价**：命中 N 行 = 1 次范围扫描 + **N 次随机 Get**，每次 Get 都要把各层走一遍。
+这也是"覆盖索引"值钱的原因——如果要的列都能从索引 key 里解析出来，阶段 2 整个省掉。
+
+**④ 范围查询 → 最贵的操作类型**
+
+```sql
+SELECT * FROM user WHERE id BETWEEN 3 AND 7;
+```
+
+```cpp
+it->Seek("t100_r3");
+while (it->Valid() && it->key() <= "t100_r7") { output(it->value()); it->Next(); }
+```
+
+```
+   点查可以"找到一个就停"，范围扫描不行 ——
+   下一个 key 可能来自任何一层，必须【同时打开所有层做多路归并】
+
+   MemTable   t100_r3  ┐
+   L0-文件2   t100_r5  ├→ 归并器按 key 排序输出，同一个 key 取最新版本
+   L1-文件7   t100_r6  │
+   L2-文件33  t100_r7  ┘
+
+   而且【布隆过滤器在这里帮不上忙】——它只能回答"某个具体 key 在不在"，
+   没法回答"这个文件里有没有 3~7 之间的 key"
+```
+
+所以范围扫描的性能取决于**层数**和 **L0 文件数**——这正是要盯着
+`rocksdb.num-files-at-level0` 的原因。
+
+**⑤ UPDATE → 一条 SQL 炸成 4 个操作**
+
+```sql
+UPDATE user SET age = 26 WHERE id = 5;
+```
+
+因为 `age` 上有索引，而**索引项的 key 里含有 age 值，改了 age 就必须换 key**：
+
+```cpp
+// 1. 先读旧值 —— 必须知道旧 age 是多少，才知道该删哪个索引项
+db->Get("t100_r5", &old);              // ["Alice", 25]
+
+WriteBatch batch;
+batch.Put("t100_r5", encode("Alice", 26));   // 2. 写新行（追加新版本，不原地改）
+batch.Delete("t100_i2_25_5");                // 3. 删旧索引项 →【写墓碑】
+batch.Put("t100_i2_26_5", "");               // 4. 写新索引项
+db->Write(batch);
+```
+
+```
+   一条 UPDATE  →  1 次 Get + 3 次写（含 1 个墓碑）
+
+   此刻磁盘上同时躺着：
+   · t100_r5 旧版本 ["Alice", 25]     在某个 SSTable
+   · t100_r5 新版本 ["Alice", 26]     在 MemTable
+   · t100_i2_25_5 本体                在某个 SSTable
+   · t100_i2_25_5 的墓碑              在 MemTable
+   · t100_i2_26_5                     在 MemTable
+
+   → 全靠后台 Compaction 慢慢清理（对照第 7、10 步）
+```
+
+> **实用推论**：如果 `SET` 的列上没有索引，就不需要那次 Get，也不需要维护索引项，
+> UPDATE 会便宜得多。**别在频繁更新的列上建索引。**
+
+**⑥ DELETE → 只是写墓碑**
+
+```sql
+DELETE FROM user WHERE id = 5;
+```
+
+```cpp
+db->Get("t100_r5", &old);          // 必须先读，才知道要删哪些索引项
+WriteBatch batch;
+batch.Delete("t100_r5");           // 墓碑 1
+batch.Delete("t100_i2_25_5");      // 墓碑 2
+db->Write(batch);
+```
+
+**数据一条都没被真正删掉**（对照第 10 步）。于是：
+
+```
+   DELETE FROM user WHERE age < 100;    -- 删掉一百万行
+
+   → 磁盘上多了两百万个墓碑，占用空间【不降反升】
+   → 之后做范围扫描，要把这两百万个墓碑全读出来再逐个丢弃
+   → "明明查不出数据，却慢得要死"
+```
+
+**⑦ ORDER BY 主键 → 免费**
+
+```sql
+SELECT * FROM user ORDER BY id LIMIT 10;
+```
+
+```cpp
+it->SeekToFirst();
+for (int i = 0; i < 10; i++) { output(it->value()); it->Next(); }
+```
+
+**不需要任何排序动作**——key 是保序编码的，RocksDB 里本来就按 id 排好了。
+这是 13.2 那个设计换来的红利。
+
+换成没有索引的列就不行：
+
+```sql
+SELECT * FROM user ORDER BY name;    -- 只能全表扫出来，在 SQL 层内存里排序
+```
+
+**⑧ COUNT(\*) → 很贵**
+
+```sql
+SELECT COUNT(*) FROM user;
+```
+
+```
+   → 全表 Iterator 扫描，一条条数
+   → 要归并所有层，还要跳过所有旧版本和墓碑
+   → 大表上基本不可用，得靠单独维护的计数器
+```
+
+### 13.4 汇总对照表
+
+| SQL | RocksDB 操作 | LSM 层面发生了什么 |
+|---|---|---|
+| `INSERT` 一行 | `Put` ×(1+索引数) | WAL 顺序写 + MemTable 插入，**极快** |
+| `WHERE 主键 = ?` | `Get` ×1 | 逐层查找，布隆过滤器挡掉绝大多数文件 |
+| `WHERE 索引列 = ?` | `Seek`+`Next`，再 `Get` ×N | **回表**：N 次随机查找 |
+| `WHERE id BETWEEN a AND b` | `Iterator` | **多路归并所有层**，布隆过滤器帮不上忙 |
+| `UPDATE`（改了索引列） | `Get`×1 + `Put`×2 + `Delete`×1 | 产生墓碑 + 多版本，等 Compaction 清理 |
+| `UPDATE`（没改索引列） | `Put` ×1 | 便宜得多 |
+| `DELETE` | `Get`×1 + `Delete`×(1+索引数) | 只写墓碑，**空间不会立刻释放** |
+| `ORDER BY 主键` | `Iterator` 顺序读 | **免费**，key 天生有序 |
+| `COUNT(*)` | 全表 `Iterator` | 很贵，大表上不可用 |
+
+### 13.5 动手看看
+
+```bash
+# 看某个 SST 文件里到底存了什么
+sst_dump --file=/data/db/000123.sst --command=scan --output_hex
+
+# 用 ldb 直接读写，观察 key 的样子
+ldb --db=/data/db put t100_r5 "Alice,25"
+ldb --db=/data/db get t100_r5
+ldb --db=/data/db scan --from=t100_r --to=t100_s     # 扫整个表
+```
+
+想用 SQL 跑起来，装 **MyRocks**（MySQL 换成 RocksDB 引擎）最方便：
+
+```sql
+CREATE TABLE user (...) ENGINE=ROCKSDB;
+SHOW ENGINE ROCKSDB STATUS;      -- 能看到各层文件数、compaction 情况
+```
+
+---
+
+## 全流程回顾
 
 如果只记一张图，记这个——**每一步都是被上一步的问题逼出来的**：
 
@@ -1042,7 +1362,9 @@ db->GetProperty("rocksdb.num-files-at-level0", &v);  // 最重要的单一指标
         ↓ 但还是要查 5~8 个文件
    ⑨ 每个文件配布隆过滤器         → 绝大多数文件被秒拒，不读磁盘
         ↓ 那删除怎么办？
-   ⑩ 写墓碑，推到最底层才真删     → 完成
+   ⑩ 写墓碑，推到最底层才真删     → 到这里，LSM 就完整了
+        ↓ 那上层的 SQL 怎么接上来？
+   ⑬ 关系表按「保序编码」拼成 key，一条 SQL 拆成若干 Put/Get/Delete/Iterator
 ```
 
 **一句话概括 LSM**：
