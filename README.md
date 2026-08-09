@@ -24,7 +24,7 @@
 
 | 笔记 | 内容 |
 |---|---|
-| [乐观锁与悲观锁](concurrency/乐观锁与悲观锁.md) | 从一次超卖 bug 讲起：两者不是两种锁而是两种**面对冲突的态度**；悲观锁三坑（WHERE 不走索引就锁一片、死锁、事务里调 RPC）、`SKIP LOCKED`、为什么 `synchronized` 一上集群就失效；乐观锁的 version 法、ABA、重试三要素、**重试为什么不能写在 `@Transactional` 内部**；「条件更新 / 唯一索引」这两条既不用锁也不用重试的路；CAS → `AtomicInteger` → `WHERE version = ?` 的三层同构；按**单 key 冲突率**（不是 QPS）选型的决策顺序 |
+| [乐观锁与悲观锁](concurrency/乐观锁与悲观锁.md) | 从一次超卖 bug 讲起：两者不是两种锁而是两种**面对冲突的态度**；悲观锁三坑（WHERE 不走索引就锁一片、死锁、事务里调 RPC）、`SKIP LOCKED`、为什么 `synchronized` 一上集群就失效；乐观锁的 version 法、ABA、重试三要素、**重试为什么不能写在 `@Transactional` 内部**；**唯一索引专章**（防的是"查-插"而非"读-改-写"，锁在这里没有行可锁、NULL 让约束失效、软删除撞唯一键、用不了 change buffer、分片键、幂等的标准解法）；「条件更新管改 / 唯一索引管插」这两条既不用锁也不用重试的路；CAS → `AtomicInteger` → `WHERE version = ?` 的三层同构；按**单 key 冲突率**（不是 QPS）选型的决策顺序 |
 
 ### 存储引擎
 
