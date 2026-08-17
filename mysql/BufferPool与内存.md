@@ -319,8 +319,8 @@ innodb_redo_log_capacity = 4G         # 8.0.30+ 用这一个参数
 ```
 
 > 那为什么"每次提交都 fsync"还能跑出高 TPS？靠**组提交**——
-> 详见《[binlog · 第四节](binlog.md)》，那里讲了 fsync 是毫秒级硬件动作、
-> 怎么用一次 fsync 服务一整批事务。
+> MySQL 会把同时提交的一批事务攒起来，一次性写盘，并发越高摊得越薄。
+> 见《[binlog · 3.2](binlog.md)》里 `sync_binlog` 那一段。
 
 ### redo log 太小的后果
 
@@ -520,6 +520,6 @@ SHOW ENGINE INNODB STATUS\G     -- LOG 段，LSN 与 checkpoint 的差
 
 - 《[B+ 树原理 · 第一章](B+树原理.md)》——16KB 页、磁盘 IO 才是瓶颈；本篇是"怎么让这些 IO 不发生"
 - 《[乐观锁与悲观锁 · 5.6 坑三](../concurrency/乐观锁与悲观锁.md)》——唯一索引用不了 change buffer，本篇第四节给出原因
-- 《[binlog · 第四节](binlog.md)》——`sync_binlog` 与组提交，和 `innodb_flush_log_at_trx_commit` 合称"双 1"
+- 《[binlog · 3.2](binlog.md)》——`sync_binlog` 与组提交，和 `innodb_flush_log_at_trx_commit` 合称"双 1"
 - 《[SQL优化进阶 · 第七节](SQL优化进阶.md)》——连接级 buffer 的具体用途（排序、JOIN、临时表）
 - 《[LSM Tree 原理 · 第 5 步](../storage/LSM树原理.md)》——"先顺序写日志、再慢慢整理数据"是两类引擎共同的地基

@@ -719,7 +719,7 @@ SHOW ENGINE INNODB STATUS\G
 
 > redo log 是另一份日志，专门管"提交了就不丢"。
 > 它和 undo log 完全是两回事：**undo 存旧值用来回滚和读快照，redo 存改动用来崩溃后重做**。
-> 详见《[binlog · 第一节](binlog.md)》。
+> 详见《[binlog · 1.3](binlog.md)》。
 
 ---
 
@@ -823,5 +823,5 @@ SHOW ENGINE INNODB STATUS\G                      -- 找 History list length
 - 《[InnoDB 锁](InnoDB锁.md)》——第 7 步的"加锁"和第 8 步的"间隙锁"，那里讲得完整
 - 《[乐观锁与悲观锁](../concurrency/乐观锁与悲观锁.md)》——第 6 步那个重试的坑，以及应用层该怎么写
 - 《[B+ 树原理](B+树原理.md)》——`trx_id` / `roll_ptr` 这两个隐藏列在一行数据里的实际位置
-- 《[binlog · 第一节](binlog.md)》——redo log 是什么，它和 undo log 的分工
+- 《[binlog · 1.3](binlog.md)》——binlog 和 redo log 的区别；redo log 管崩溃恢复，undo log 管回滚和读快照
 - 《[分区表与分库分表 · 第 3 步](分区表与分库分表.md)》——`DELETE` 1000 万行为什么慢：每行都要写 undo，而这些 undo 在事务结束前扔不掉
